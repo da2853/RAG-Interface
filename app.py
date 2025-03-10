@@ -10,6 +10,8 @@ import uuid
 import time
 import json
 from pathlib import Path
+import concurrent.futures
+
 
 # Set page configuration
 st.set_page_config(
@@ -68,6 +70,19 @@ if 'collection_name' not in st.session_state:
 # Set OpenAI API key
 if api_keys["OPENAI_API_KEY"]:
     openai.api_key = api_keys["OPENAI_API_KEY"]
+
+def check_duplicate_files(uploaded_files):
+    """Check for duplicate files in the uploaded list compared to processed files."""
+    duplicates = []
+    new_files = []
+    
+    for file in uploaded_files:
+        if file.name in st.session_state.processed_files:
+            duplicates.append(file.name)
+        else:
+            new_files.append(file)
+    
+    return new_files, duplicates
 
 def save_config():
     """Save the current configuration and processed files to disk."""
@@ -533,9 +548,227 @@ def search_similar_chunks(collection_name, query_embedding, limit=5):
     except Exception as e:
         st.error(f"Error searching Qdrant: {str(e)}")
         return []
+    
+def generate_answers_concurrently(query, context_chunks, models):
+    """Generate answers using multiple models concurrently with proper parallelism.
+    Returns results as they become available through a dictionary."""
+    import concurrent.futures
+    import time
+    
+    # Dictionary to store results
+    results = {}
+    
+    def generate_for_model(model):
+        """Worker function that processes a single model request"""
+        try:
+            start_time = time.time()
+            
+            # Call API to generate answer (this happens in parallel)
+            answer, sources = generate_answer(query, context_chunks, model=model)
+            
+            process_time = time.time() - start_time
+            
+            return {
+                "model": model,
+                "answer": answer,
+                "sources": sources,
+                "time_taken": process_time,
+                "status": "Completed"
+            }
+                
+        except Exception as e:
+            error_msg = f"Error with {model}: {str(e)}"
+            
+            return {
+                "model": model,
+                "answer": error_msg,
+                "sources": [],
+                "status": "Error",
+                "error": str(e)
+            }
+    
+    # Use ThreadPoolExecutor for concurrent execution
+    futures = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(models), 5)) as executor:
+        # Submit all tasks at once for true parallelism
+        futures = [executor.submit(generate_for_model, model) for model in models]
+    
+    # Return the futures for the main thread to check
+    return futures
+
+
+# And here's how you would use it in your Streamlit app:
+def use_concurrent_models_in_app(query, similar_chunks, selected_models):
+    """Example of how to use the concurrent function in the Streamlit UI"""
+    # Create UI placeholders first (in the main thread)
+    model_placeholders = {}
+    result_placeholders = {}
+    
+    for model in selected_models:
+        model_placeholders[model] = st.empty()
+        model_placeholders[model].info(f"Starting request for {model}...")
+        result_placeholders[model] = st.empty()
+    
+    # Start the concurrent processing
+    results, model_status, futures = generate_answers_concurrently(query, similar_chunks, selected_models)
+    
+    # Poll for updates (in the main thread)
+    import time
+    all_complete = False
+    
+    while not all_complete:
+        # Update UI based on current status
+        all_complete = True
+        
+        for model in selected_models:
+            # Check if this model has results
+            if model in results:
+                result = results[model]
+                # This model is done, show its results
+                if result["status"] == "Completed":
+                    model_placeholders[model].success(f"Completed in {result['time_taken']:.2f}s")
+                    result_placeholders[model].markdown(result["answer"])
+                elif result["status"] == "Error":
+                    model_placeholders[model].error(f"Error: {result.get('error', 'Unknown error')}")
+                    result_placeholders[model].error(result["answer"])
+            else:
+                # Still waiting for this model
+                status = model_status.get(model, {})
+                if status.get("status") == "In progress":
+                    model_placeholders[model].info(f"Processing with {model}...")
+                    all_complete = False
+                else:
+                    all_complete = False
+                    
+        # Short sleep to prevent UI freezing
+        time.sleep(0.1)
+        
+    # Final check to ensure all results are displayed
+    for model in selected_models:
+        if model in results and results[model]["status"] == "Completed":
+            if "sources" not in locals():
+                # Store sources from first completed model
+                sources = results[model]["sources"]
+    
+    return results, sources
+def generate_answer_streaming(query, context_chunks, model="qwen/qwq-32b"):
+    """Generate an answer using OpenRouter API with streaming support."""
+    if not api_keys["OPENROUTER_API_KEY"]:
+        yield "Error: OpenRouter API key not provided"
+        return
+    
+    # Order chunks by document and position
+    ordered_chunks = []
+    doc_chunks = {}
+    
+    for chunk in context_chunks:
+        doc = chunk['document']
+        if doc not in doc_chunks:
+            doc_chunks[doc] = []
+        doc_chunks[doc].append(chunk)
+    
+    # Sort chunks within each document by index
+    for doc, chunks in doc_chunks.items():
+        ordered_chunks.extend(sorted(chunks, key=lambda x: x.get('chunk_index', 0)))
+    
+    # Prepare context
+    context_parts = []
+    for i, chunk in enumerate(ordered_chunks):
+        doc_name = chunk['document']
+        context_parts.append(f"[Document: {doc_name}]\n{chunk['text']}\n")
+    
+    context = "\n".join(context_parts)
+    
+    # Prepare the request
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_keys['OPENROUTER_API_KEY']}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream"  # Explicitly request SSE format
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are an AI assistant helping with exam questions for a HCI College Graduate Course. "
+                        "Answer based on the provided context and your understanding of HCI. "
+                        "If the information is not in the context, say 'Based on the provided documents, I don't have enough information to answer this question.' "
+                        "Be precise and clear. When quoting from the documents, indicate which document the information comes from."
+            },
+            {
+                "role": "user",
+                "content": f"Here are relevant excerpts from my exam materials:\n\n{context}\n\nBased on these materials and your understanding of HCI, please answer this question: {query}"
+            }
+        ],
+        "stream": True
+    }
+    
+    # Make streaming request
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            with requests.post(url, headers=headers, json=payload, stream=True, timeout=90) as response:
+                if response.status_code != 200:
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        yield f"Error: {response.status_code} - {response.text}"
+                        return
+                    time.sleep(2 ** retry_count)  # Exponential backoff
+                    continue
+                
+                # Process streaming response line by line (better for SSE parsing)
+                for line in response.iter_lines(decode_unicode=True):
+                    if not line or not line.strip():
+                        continue
+                    
+                    if line.startswith('data: '):
+                        data = line[6:].strip()
+                        if data == '[DONE]':
+                            return
+                        
+                        try:
+                            data_obj = json.loads(data)
+                            # Handle different response formats
+                            if "choices" in data_obj and len(data_obj["choices"]) > 0:
+                                choice = data_obj["choices"][0]
+                                # Check delta (streaming) or message (non-streaming) format
+                                if "delta" in choice:
+                                    content = choice["delta"].get("content", "")
+                                elif "message" in choice:
+                                    content = choice["message"].get("content", "")
+                                else:
+                                    content = ""
+                                
+                                if content:
+                                    yield content
+                        except Exception as e:
+                            # Log error but continue processing
+                            print(f"Error parsing streaming data: {e}")
+                            continue
+            
+            return
+            
+        except requests.exceptions.Timeout:
+            retry_count += 1
+            if retry_count >= max_retries:
+                yield "Error: Request to OpenRouter timed out after multiple attempts"
+                return
+            
+            time.sleep(3 ** retry_count)  # Wait longer for timeout issues
+            
+        except Exception as e:
+            retry_count += 1
+            if retry_count >= max_retries:
+                yield f"Error generating answer after {max_retries} attempts: {str(e)}"
+                return
+            
+            time.sleep(2 ** retry_count)  # Exponential backoff
 
 def generate_answer(query, context_chunks, model="qwen/qwq-32b"):
-    """Generate an answer using OpenRouter API with retry logic."""
+    """Generate an answer using OpenRouter API without streaming."""
     if not api_keys["OPENROUTER_API_KEY"]:
         return "Error: OpenRouter API key not provided", []
     
@@ -561,6 +794,30 @@ def generate_answer(query, context_chunks, model="qwen/qwq-32b"):
     
     context = "\n".join(context_parts)
     
+    # Prepare the request
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_keys['OPENROUTER_API_KEY']}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are an AI assistant helping with exam questions for a HCI College Graduate Course. "
+                        "Answer based on the provided context and your understanding of HCI. "
+                        "If the information is not in the context, say 'Based on the provided documents, I don't have enough information to answer this question.' "
+                        "Be precise and clear. When quoting from the documents, indicate which document the information comes from."
+            },
+            {
+                "role": "user",
+                "content": f"Here are relevant excerpts from my exam materials:\n\n{context}\n\nBased on these materials and your understanding of HCI, please answer this question: {query}"
+            }
+        ],
+        "stream": False  # Ensure streaming is disabled
+    }
+    
     # Retry logic
     max_retries = 3
     retry_count = 0
@@ -568,27 +825,9 @@ def generate_answer(query, context_chunks, model="qwen/qwq-32b"):
     while retry_count < max_retries:
         try:
             response = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_keys['OPENROUTER_API_KEY']}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "You are an AI assistant helping with exam questions for a HCI College Graduate Course"
-                                    "Answer based on the provided context and your understanding of HCI."
-                                    "If the information is not in the context, say 'Based on the provided documents, I don't have enough information to answer this question.' "
-                                    "Be precise and clear. When quoting from the documents, indicate which document the information comes from."
-                        },
-                        {
-                            "role": "user",
-                            "content": f"Here are relevant excerpts from my exam materials:\n\n{context}\n\nBased on these materials and your understanding of HCI, please answer this question: {query}"
-                        }
-                    ]
-                },
+                url,
+                headers=headers,
+                json=payload,
                 timeout=30  # 30 second timeout
             )
             
@@ -711,13 +950,27 @@ with tab1:
     
     uploaded_files = st.file_uploader("Choose PDF files", type="pdf", accept_multiple_files=True)
     
+    # Check for duplicates and provide feedback
+    if uploaded_files:
+        new_files, duplicates = check_duplicate_files(uploaded_files)
+        
+        if duplicates:
+            st.warning(f"The following files have already been processed: {', '.join(duplicates)}")
+            
+        if not new_files and duplicates:
+            st.info("All uploaded files have already been processed. You can proceed to the 'Ask Questions' tab.")
+        
+        # Display count of new files to be processed
+        if new_files:
+            st.info(f"{len(new_files)} new file(s) ready for processing.")
+    
     # Chunking options
     with st.expander("Advanced Options"):
         chunk_size = st.slider("Chunk Size", min_value=200, max_value=2000, value=700, 
                               help="Number of characters in each chunk (700 recommended for academic material)")
         chunk_overlap = st.slider("Chunk Overlap", min_value=50, max_value=500, value=175,
                                  help="Number of overlapping characters between chunks (175 recommended)")
-        
+    
     # Add info about optimal settings
     with st.expander("Chunking Settings Guide"):
         st.markdown("""
@@ -732,8 +985,8 @@ with tab1:
         - **25% of chunk size**: Ensures concepts don't get split between chunks
         
         #### Number of Chunks to Retrieve
-        - **5-7 chunks**: Balanced context for most questions
-        - **7-10 chunks**: For complex questions requiring more context
+        - **5-10 chunks**: Balanced context for most questions
+        - **10-15 chunks**: For complex questions requiring more context
         """)
     
     if uploaded_files:
@@ -744,66 +997,68 @@ with tab1:
             elif not initialize_qdrant_collection(st.session_state.collection_name):
                 st.error("Failed to initialize Qdrant collection")
             else:
-                progress_bar = st.progress(0)
-                status_text = st.empty()
+                # Use only new files for processing
+                new_files, _ = check_duplicate_files(uploaded_files)
                 
-                successful_files = 0
-                
-                for i, uploaded_file in enumerate(uploaded_files):
-                    file_name = uploaded_file.name
-                    status_text.text(f"Processing {file_name}...")
-                    
-                    # Check if file already processed
-                    if file_name in st.session_state.processed_files:
-                        status_text.text(f"Skipping {file_name} (already processed)")
-                        progress_bar.progress((i + 1) / len(uploaded_files))
-                        continue
-                    
-                    # Extract text from PDF
-                    text, error = extract_text_from_pdf(uploaded_file)
-                    
-                    if error:
-                        st.error(f"Error processing {file_name}: {error}")
-                        progress_bar.progress((i + 1) / len(uploaded_files))
-                        continue
-                    
-                    # Split text into chunks
-                    chunks = split_text_into_chunks(text, chunk_size=chunk_size, overlap=chunk_overlap)
-                    
-                    if not chunks:
-                        st.warning(f"No text chunks extracted from {file_name}")
-                        progress_bar.progress((i + 1) / len(uploaded_files))
-                        continue
-                    
-                    # Create embeddings
-                    status_text.text(f"Creating embeddings for {file_name}...")
-                    embeddings = create_embeddings(chunks)
-                    
-                    if not embeddings:
-                        st.error(f"Failed to create embeddings for {file_name}")
-                        progress_bar.progress((i + 1) / len(uploaded_files))
-                        continue
-                    
-                    # Store in Qdrant
-                    status_text.text(f"Storing embeddings for {file_name}...")
-                    if store_embeddings_in_qdrant(
-                        st.session_state.collection_name, 
-                        embeddings, 
-                        {"filename": file_name}
-                    ):
-                        st.session_state.processed_files.append(file_name)
-                        successful_files += 1
-                    
-                    progress_bar.progress((i + 1) / len(uploaded_files))
-                
-                progress_bar.progress(1.0)
-                status_text.text("Processing complete!")
-                
-                if successful_files > 0:
-                    st.success(f"Successfully processed {successful_files} out of {len(uploaded_files)} documents")
+                if not new_files:
+                    st.info("No new files to process. All uploaded files have already been processed.")
                 else:
-                    st.error("Failed to process any documents")
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
                     
+                    successful_files = 0
+                    
+                    for i, uploaded_file in enumerate(new_files):
+                        file_name = uploaded_file.name
+                        status_text.text(f"Processing {file_name}...")
+                        
+                        # Extract text from PDF
+                        text, error = extract_text_from_pdf(uploaded_file)
+                        
+                        if error:
+                            st.error(f"Error processing {file_name}: {error}")
+                            progress_bar.progress((i + 1) / len(new_files))
+                            continue
+                        
+                        # Split text into chunks
+                        chunks = split_text_into_chunks(text, chunk_size=chunk_size, overlap=chunk_overlap)
+                        
+                        if not chunks:
+                            st.warning(f"No text chunks extracted from {file_name}")
+                            progress_bar.progress((i + 1) / len(new_files))
+                            continue
+                        
+                        # Create embeddings
+                        status_text.text(f"Creating embeddings for {file_name}...")
+                        embeddings = create_embeddings(chunks)
+                        
+                        if not embeddings:
+                            st.error(f"Failed to create embeddings for {file_name}")
+                            progress_bar.progress((i + 1) / len(new_files))
+                            continue
+                        
+                        # Store in Qdrant
+                        status_text.text(f"Storing embeddings for {file_name}...")
+                        if store_embeddings_in_qdrant(
+                            st.session_state.collection_name, 
+                            embeddings, 
+                            {"filename": file_name}
+                        ):
+                            st.session_state.processed_files.append(file_name)
+                            successful_files += 1
+                        
+                        progress_bar.progress((i + 1) / len(new_files))
+                    
+                    progress_bar.progress(1.0)
+                    status_text.text("Processing complete!")
+                    
+                    if successful_files > 0:
+                        st.success(f"Successfully processed {successful_files} out of {len(new_files)} documents")
+                        
+                        # Save updated file list to config
+                        save_config()
+                    else:
+                        st.error("Failed to process any documents")
                     
 # Ask Questions Tab
 with tab2:
@@ -817,26 +1072,39 @@ with tab2:
         col1, col2 = st.columns([1, 1])
         
         with col1:
-            model = st.selectbox(
-                "Select model:",
-                [
-                    "qwen/qwq-32b",
-                    "qwen/qwen-max",
-                    "google/gemini-2.0-flash-001",
-                    "google/gemini-pro",
-                    "google/gemini-2.0-flash-thinking-exp:free",
-                    "deepseek/deepseek-r1-distill-llama-70b"
-                ]
+            available_models = [
+                "qwen/qwq-32b",
+                "qwen/qwen-max",
+                "google/gemini-2.0-flash-001",
+                "google/gemini-pro",
+                "google/gemini-2.0-flash-thinking-exp:free",
+                "deepseek/deepseek-r1-distill-llama-70b",
+                "anthropic/claude-3.7-sonnet:thinking",
+                "openai/o3-mini-high",
+                "openai/chatgpt-4o-latest",
+                "openai/o1"
+            ]
+            selected_models = st.multiselect(
+                "Select models (max 5 recommended):",
+                available_models,
+                default=[available_models[0]]  # Default to first model
             )
+            
+            if not selected_models:
+                st.warning("Please select at least one model")
         
         with col2:
-            search_limit = st.slider("Number of chunks to retrieve:", min_value=3, max_value=15, value=7)
+            search_limit = st.slider("Number of chunks to retrieve:", min_value=3, max_value=25, value=10)
+            
+        # New option for streaming responses
+        enable_streaming = st.checkbox("Enable streaming responses", value=True)
         
-        if st.button("Get Answer") and query:
+        # Inside the "Ask Questions" tab
+        if st.button("Get Answer") and query and selected_models:
             if not api_keys["OPENAI_API_KEY"] or not api_keys["OPENROUTER_API_KEY"]:
                 st.error("Both OpenAI and OpenRouter API keys are required")
             else:
-                with st.spinner("Generating answer..."):
+                with st.spinner("Processing query..."):
                     try:
                         # Create embedding for query
                         query_embedding_response = openai.embeddings.create(
@@ -853,35 +1121,88 @@ with tab2:
                         )
                         
                         if similar_chunks:
-                            # Generate answer
-                            answer, sources = generate_answer(query, similar_chunks, model=model)
+                            # Create tabs for each model
+                            model_tabs = st.tabs(selected_models)
                             
-                            # Display answer
-                            st.subheader("Answer:")
-                            st.markdown(answer)
+                            # Create placeholders inside each tab
+                            model_placeholders = {}
+                            result_placeholders = {}
                             
-                            # Display sources
-                            with st.expander("View Source Documents"):
-                                # Group sources by document
-                                doc_sources = {}
-                                for source in sources:
-                                    doc = source['document']
-                                    if doc not in doc_sources:
-                                        doc_sources[doc] = []
-                                    doc_sources[doc].append(source)
+                            for i, model in enumerate(selected_models):
+                                with model_tabs[i]:
+                                    model_placeholders[model] = st.empty()
+                                    model_placeholders[model].info(f"Starting request for {model}...")
+                                    result_placeholders[model] = st.empty()
+                            
+                            # Process with streaming or concurrent generation based on user choice
+                            if enable_streaming and len(selected_models) == 1:
+                                # Single model with streaming
+                                model = selected_models[0]
+                                with model_tabs[0]:
+                                    answer_container = result_placeholders[model]
+                                    status_container = model_placeholders[model]
+                                    status_container.info(f"Streaming response from {model}...")
+                                    
+                                    full_answer = ""
+                                    for text_chunk in generate_answer_streaming(query, similar_chunks, model=model):
+                                        full_answer += text_chunk
+                                        answer_container.markdown(full_answer)
+                                    
+                                    status_container.success(f"Completed streaming from {model}")
+                                    
+                                    # Get sources for the single model (we need to run the non-streaming version to get sources)
+                                    _, all_sources = generate_answer(query, similar_chunks, model=model)
+                            else:
+                                # Submit all tasks concurrently and get futures
+                                futures = generate_answers_concurrently(query, similar_chunks, selected_models)
                                 
-                                # Display sources by document
-                                for doc, chunks in doc_sources.items():
-                                    st.markdown(f"### Document: {doc}")
-
-                                    for i, source in enumerate(chunks):
-                                        st.markdown(f"**Excerpt {i+1} (Relevance: {source['score']:.2f})**")
-                                        st.text_area(f"Excerpt {i+1}", value=source['text'], height=150, disabled=True)
-
+                                # Initialize sources
+                                all_sources = None
+                                
+                                # Process results as they complete (in the main thread)
+                                for future in concurrent.futures.as_completed(futures):
+                                    try:
+                                        # Get the result
+                                        result = future.result()
+                                        model = result["model"]
+                                        
+                                        # Update UI with the result (safe in main thread)
+                                        if result["status"] == "Completed":
+                                            model_placeholders[model].success(f"Completed in {result['time_taken']:.2f}s")
+                                            result_placeholders[model].markdown(result["answer"])
+                                            
+                                            # Store sources from first completed model
+                                            if all_sources is None:
+                                                all_sources = result["sources"]
+                                        else:
+                                            model_placeholders[model].error(f"Error with {model}")
+                                            result_placeholders[model].error(result["answer"])
+                                            
+                                    except Exception as e:
+                                        # If we can't determine which model had an error, show a general error
+                                        st.error(f"Error processing a model: {str(e)}")
+                                                            
+                            # Display sources in an expander outside the tabs
+                            if all_sources:
+                                with st.expander("View Source Documents"):
+                                    # Group sources by document
+                                    doc_sources = {}
+                                    for source in all_sources:
+                                        doc = source['document']
+                                        if doc not in doc_sources:
+                                            doc_sources[doc] = []
+                                        doc_sources[doc].append(source)
+                                    
+                                    # Display sources by document
+                                    for doc, chunks in doc_sources.items():
+                                        st.markdown(f"### Document: {doc}")
+                                        for i, source in enumerate(chunks):
+                                            st.markdown(f"**Excerpt {i+1} (Relevance: {source['score']:.2f})**")
+                                            st.text_area(f"Excerpt {i+1}", value=source['text'], height=150, disabled=True)
+                        else:
                             st.error("No relevant information found in the documents.")
                     except Exception as e:
                         st.error(f"Error processing your query: {str(e)}")
-
 # Footer
 st.markdown("---")
 st.markdown("ExamGPT: Graph RAG for Open Book Exams")
