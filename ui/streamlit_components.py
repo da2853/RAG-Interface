@@ -708,8 +708,11 @@ class UIComponents:
             "google/gemini-2.0-flash-001",
             "google/gemini-pro",
             "google/gemini-2.0-flash-thinking-exp:free",
+            "google/gemini-2.0-pro-exp-02-05:free",
             "deepseek/deepseek-r1-distill-llama-70b",
+            "deepseek/deepseek-chat",
             "anthropic/claude-3.7-sonnet:thinking",
+            "cohere/command-a",
             "openai/o3-mini-high",
             "openai/chatgpt-4o-latest",
             "openai/o1"
