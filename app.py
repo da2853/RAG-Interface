@@ -11,6 +11,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+import streamlit as st  # Import Streamlit at the file level
 
 # Add the project root to the Python path
 project_root = Path(__file__).parent
@@ -36,6 +37,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def initialize_session_state():
+    """
+    Initialize Streamlit session state variables.
+    This ensures all required session state variables exist.
+    """
+    if 'processed_files' not in st.session_state:
+        st.session_state.processed_files = []
+        
+    if 'show_collection_manager' not in st.session_state:
+        st.session_state.show_collection_manager = False
+
 def main():
     """
     Main entry point for the DocumentGPT application.
@@ -43,6 +55,9 @@ def main():
     """
     try:
         logger.info("Starting DocumentGPT application")
+
+        # Initialize session state
+        initialize_session_state()
         
         # Initialize configuration manager
         config_manager = ConfigManager()
@@ -80,7 +95,6 @@ def main():
         logger.error(traceback.format_exc())
         
         # Display error in UI if possible
-        import streamlit as st
         st.error(f"Application initialization error: {str(e)}")
 
 if __name__ == "__main__":

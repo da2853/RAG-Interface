@@ -31,16 +31,104 @@ class UIComponents:
         with st.sidebar:
             st.title("⚙️ Configuration")
             
-            # Collection information
-            st.subheader("Collection Info")
-            st.write(f"Current collection: `{config_manager.collection_name}`")
-            
-            # Option to reset collection
-            if st.button("Create New Collection"):
-                config_manager.reset_collection()
-                st.success(f"Created new collection: {config_manager.collection_name}")
-                st.rerun()
-            
+            """
+            Updated UI components for improved collection management.
+            """
+
+            # Replace the collection management section in UIComponents.create_sidebar
+
+            # Collection management section
+            st.subheader("Collection Management")
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.write(f"Current: `{config_manager.collection_name}`")
+
+            with col2:
+                try:
+                    from vector_db.qdrant_manager import QdrantManager
+                    
+                    # Create QdrantManager with current settings
+                    qdrant_manager = QdrantManager(
+                        url=config_manager.api_keys["QDRANT_URL"],
+                        api_key=config_manager.api_keys["QDRANT_API_KEY"],
+                        show_status=False  # Don't show status in sidebar
+                    )
+                    
+                    # Get list of collections
+                    collections = qdrant_manager.list_collections()
+                    
+                    if collections:
+                        # Option to switch collections
+                        if st.button("Manage Collections"):
+                            st.session_state.show_collection_manager = True
+                            
+                    else:
+                        st.write("No collections found")
+                        
+                except Exception as e:
+                    st.error(f"Error connecting to Qdrant: {str(e)}")
+
+            # Add collection manager UI if requested
+            if st.session_state.get("show_collection_manager", False):
+                st.subheader("Collection Manager")
+                
+                # Get list of collections
+                try:
+                    collections = qdrant_manager.list_collections()
+                    
+                    if collections:
+                        # Display available collections
+                        st.write("Available Collections:")
+                        
+                        for collection in collections:
+                            col1, col2, col3 = st.columns([3, 1, 1])
+                            
+                            with col1:
+                                st.write(f"`{collection}`")
+                            
+                            with col2:
+                                if collection != config_manager.collection_name:
+                                    if st.button("Switch", key=f"switch_{collection}"):
+                                        config_manager.switch_collection(collection)
+                                        st.session_state.show_collection_manager = False
+                                        st.rerun()
+                            
+                            with col3:
+                                if st.button("Delete", key=f"delete_{collection}"):
+                                    if qdrant_manager.delete_collection(collection):
+                                        st.success(f"Deleted collection: {collection}")
+                                        # If we deleted the current collection, create a new one
+                                        if collection == config_manager.collection_name:
+                                            new_name = config_manager.create_new_collection()
+                                            st.info(f"Created new collection: {new_name}")
+                                            st.rerun()
+                                    else:
+                                        st.error(f"Failed to delete collection: {collection}")
+                    
+                    # Create new collection form
+                    st.subheader("Create New Collection")
+                    with st.form("new_collection_form"):
+                        collection_name = st.text_input("Collection Name (optional)")
+                        create_submit = st.form_submit_button("Create Collection")
+                        
+                        if create_submit:
+                            new_name = config_manager.create_new_collection(collection_name)
+                            if qdrant_manager.initialize_collection(new_name):
+                                st.success(f"Created new collection: {new_name}")
+                                st.session_state.show_collection_manager = False
+                                st.rerun()
+                            else:
+                                st.error("Failed to initialize collection")
+                    
+                    # Close manager button
+                    if st.button("Close Manager"):
+                        st.session_state.show_collection_manager = False
+                        st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"Error managing collections: {str(e)}")
+
             # Sync button to check what files are in Qdrant
             if st.button("Sync Files from Database"):
                 with st.spinner("Syncing files..."):

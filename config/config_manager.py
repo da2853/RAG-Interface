@@ -351,3 +351,59 @@ class ConfigManager:
         
         logger.warning(f"Cannot select non-existent template: {template_name}")
         return False
+    
+    def get_all_collections(self, qdrant_manager):
+        """
+        Get all collections from Qdrant.
+        
+        Args:
+            qdrant_manager: QdrantManager instance
+            
+        Returns:
+            list: List of collection names
+        """
+        return qdrant_manager.list_collections()
+
+    def switch_collection(self, collection_name: str) -> bool:
+        """
+        Switch to a different collection.
+        
+        Args:
+            collection_name: Name of the collection to switch to
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        self._collection_name = collection_name
+        # Reset processed files list as it's specific to the collection
+        self.processed_files = []
+        self.save_config()
+        logger.info(f"Switched to collection: {collection_name}")
+        return True
+
+    def create_new_collection(self, name: Optional[str] = None) -> str:
+        """
+        Create a new collection with an optional custom name.
+        
+        Args:
+            name: Custom name for the collection (generates a random name if None)
+            
+        Returns:
+            str: Name of the new collection
+        """
+        if name:
+            # Sanitize the name (remove spaces, special chars)
+            sanitized_name = ''.join(c for c in name if c.isalnum() or c == '_').lower()
+            if not sanitized_name:
+                # Fallback to random name if sanitized name is empty
+                sanitized_name = f"rag_docs_{uuid.uuid4().hex[:8]}"
+            self._collection_name = sanitized_name
+        else:
+            # Generate a random collection name
+            self._collection_name = f"rag_docs_{uuid.uuid4().hex[:8]}"
+        
+        # Reset processed files for the new collection
+        self.processed_files = []
+        self.save_config()
+        logger.info(f"Created new collection: {self._collection_name}")
+        return self._collection_name

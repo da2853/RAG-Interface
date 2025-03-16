@@ -432,3 +432,166 @@ class QdrantManager:
         except Exception as e:
             logger.error(f"Error deleting collection {collection_name}: {str(e)}")
             return False
+        
+        
+    def list_collections(self) -> List[str]:
+        """
+        List all available collections in Qdrant.
+        
+        Returns:
+            list: List of collection names
+        """
+        try:
+            collections = self.client.get_collections().collections
+            collection_names = [c.name for c in collections]
+            logger.info(f"Found {len(collection_names)} collections in Qdrant")
+            return collection_names
+        except Exception as e:
+            logger.error(f"Error listing collections: {str(e)}")
+            if self.show_status:
+                st.error(f"Error listing collections: {str(e)}")
+            return []
+
+    def collection_exists(self, collection_name: str) -> bool:
+        """
+        Check if a collection exists in Qdrant.
+        
+        Args:
+            collection_name: Name of the collection to check
+            
+        Returns:
+            bool: True if the collection exists, False otherwise
+        """
+        try:
+            collections = self.client.get_collections().collections
+            collection_names = [c.name for c in collections]
+            return collection_name in collection_names
+        except Exception as e:
+            logger.error(f"Error checking collection existence: {str(e)}")
+            return False
+
+    def get_collection_info(self, collection_name: str) -> Dict[str, Any]:
+        """
+        Get information about a collection.
+        
+        Args:
+            collection_name: Name of the collection
+            
+        Returns:
+            dict: Collection information including vector count and configuration
+        """
+        try:
+            if not self.collection_exists(collection_name):
+                logger.warning(f"Collection {collection_name} does not exist")
+                return {}
+            
+            # Get collection info
+            collection_info = self.client.get_collection(collection_name=collection_name)
+            
+            # Get collection count (approximate)
+            try:
+                count_response = self.client.count(
+                    collection_name=collection_name,
+                    count_filter=None  # Count all points
+                )
+                count = count_response.count
+            except Exception as e:
+                logger.warning(f"Error getting count for collection {collection_name}: {str(e)}")
+                count = 0
+            
+            # Build info dict
+            info = {
+                "name": collection_name,
+                "vector_size": collection_info.config.params.size,
+                "distance": str(collection_info.config.params.distance),
+                "vector_count": count,
+                "created_at": collection_info.hnswconfig.m if hasattr(collection_info, 'hnswconfig') else None
+            }
+            
+            return info
+        except Exception as e:
+            logger.error(f"Error getting collection info: {str(e)}")
+            return {}
+
+    def rename_collection(self, old_name: str, new_name: str) -> bool:
+        """
+        Rename a collection by creating a new one with the same data.
+        
+        Args:
+            old_name: Current collection name
+            new_name: New collection name
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if old_name == new_name:
+            return True
+            
+        if not self.collection_exists(old_name):
+            logger.error(f"Source collection {old_name} does not exist")
+            return False
+            
+        if self.collection_exists(new_name):
+            logger.error(f"Target collection {new_name} already exists")
+            return False
+        
+        try:
+            # Get collection info to recreate it
+            collection_info = self.client.get_collection(collection_name=old_name)
+            vector_size = collection_info.config.params.size
+            distance = collection_info.config.params.distance
+            
+            # Create new collection with same parameters
+            self.client.create_collection(
+                collection_name=new_name,
+                vectors_config=models.VectorParams(
+                    size=vector_size,
+                    distance=distance
+                )
+            )
+            
+            # Copy all points in batches
+            batch_size = 100
+            offset = None
+            
+            while True:
+                # Get batch of points
+                points, offset = self.client.scroll(
+                    collection_name=old_name,
+                    limit=batch_size,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=True
+                )
+                
+                if not points:
+                    break
+                    
+                # Create point structs
+                point_structs = []
+                for point in points:
+                    point_structs.append(
+                        models.PointStruct(
+                            id=point.id,
+                            vector=point.vector,
+                            payload=point.payload
+                        )
+                    )
+                    
+                # Insert into new collection
+                if point_structs:
+                    self.client.upsert(
+                        collection_name=new_name,
+                        points=point_structs
+                    )
+                    
+                # If no offset, we've reached the end
+                if offset is None:
+                    break
+            
+            logger.info(f"Successfully renamed collection from {old_name} to {new_name}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error renaming collection: {str(e)}")
+            return False
