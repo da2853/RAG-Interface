@@ -113,10 +113,10 @@ class AnswerGenerator:
         return "\n".join(context_parts), ordered_chunks
     
     def generate_answer(self, 
-                       query: str, 
-                       context_chunks: Optional[List[Dict[str, Any]]] = None,
-                       model: str = "qwen/qwq-32b",
-                       use_context: bool = True) -> Tuple[str, List[Dict[str, Any]]]:
+                    query: str, 
+                    context_chunks: Optional[List[Dict[str, Any]]] = None,
+                    model: str = "qwen/qwq-32b",
+                    use_context: bool = True) -> Tuple[str, List[Dict[str, Any]]]:
         """
         Generate an answer using OpenRouter API without streaming.
         
@@ -151,10 +151,23 @@ class AnswerGenerator:
             "Content-Type": "application/json"
         }
         
-        # Prepare user message based on whether we're using context
-        if use_context and context_chunks:
-            user_message = f"Here are relevant excerpts from documents:\n\n{context}\n\nBased on these materials, please answer this question: {query}"
+        # Select appropriate system prompt based on context mode
+        if use_context:
+            # Use the standard system prompt for document context
+            system_prompt = self.system_prompt
+            # Prepare user message with context
+            if context_chunks:
+                user_message = f"Here are relevant excerpts from documents:\n\n{context}\n\nBased on these materials, please answer this question: {query}"
+            else:
+                user_message = query
         else:
+            # For direct queries, use a modified system prompt without document references
+            system_prompt = (
+                "You are an AI assistant helping answer questions. "
+                "Answer based on your general knowledge and training. "
+                "Be precise and clear in your responses."
+            )
+            # Use query directly without document context
             user_message = query
         
         payload = {
@@ -162,7 +175,7 @@ class AnswerGenerator:
             "messages": [
                 {
                     "role": "system",
-                    "content": self.system_prompt
+                    "content": system_prompt
                 },
                 {
                     "role": "user",
@@ -232,10 +245,10 @@ class AnswerGenerator:
         return "An unexpected error occurred", []
     
     def generate_answer_streaming(self, 
-                                 query: str, 
-                                 context_chunks: Optional[List[Dict[str, Any]]] = None, 
-                                 model: str = "qwen/qwq-32b",
-                                 use_context: bool = True) -> Iterator[str]:
+                                query: str, 
+                                context_chunks: Optional[List[Dict[str, Any]]] = None, 
+                                model: str = "qwen/qwq-32b",
+                                use_context: bool = True) -> Iterator[str]:
         """
         Generate an answer using OpenRouter API with streaming support.
         
@@ -255,13 +268,27 @@ class AnswerGenerator:
             yield "Error: OpenRouter API key not provided"
             return
         
-        # Prepare context if needed
-        if use_context and context_chunks:
-            context, _ = self._prepare_context(context_chunks)
-            # Prepare user message with context
-            user_message = f"Here are relevant excerpts from documents:\n\n{context}\n\nBased on these materials, please answer this question: {query}"
+        # Select appropriate system prompt based on context mode
+        if use_context:
+            # Use the standard system prompt for document context
+            system_prompt = self.system_prompt
+            
+            # Prepare context if needed
+            if context_chunks:
+                context, _ = self._prepare_context(context_chunks)
+                # Prepare user message with context
+                user_message = f"Here are relevant excerpts from documents:\n\n{context}\n\nBased on these materials, please answer this question: {query}"
+            else:
+                # Use query directly if no context chunks available
+                user_message = query
         else:
-            # Use query directly without context
+            # For direct queries, use a modified system prompt without document references
+            system_prompt = (
+                "You are an AI assistant helping answer questions. "
+                "Answer based on your general knowledge and training. "
+                "Be precise and clear in your responses."
+            )
+            # Use query directly without document context
             user_message = query
         
         # Prepare the request
@@ -276,7 +303,7 @@ class AnswerGenerator:
             "messages": [
                 {
                     "role": "system",
-                    "content": self.system_prompt
+                    "content": system_prompt
                 },
                 {
                     "role": "user",
@@ -358,7 +385,7 @@ class AnswerGenerator:
                     return
                 
                 time.sleep(2 ** retry_count)  # Exponential backoff
-    
+        
     def generate_answers_concurrently(self, 
                                      query: str, 
                                      context_chunks: Optional[List[Dict[str, Any]]] = None, 

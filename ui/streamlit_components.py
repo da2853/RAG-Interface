@@ -400,9 +400,9 @@ class UIComponents:
     
     @staticmethod
     def create_question_tab(config_manager, 
-                           embedding_creator, 
-                           qdrant_manager, 
-                           answer_generator) -> None:
+                        embedding_creator, 
+                        qdrant_manager, 
+                        answer_generator) -> None:
         """
         Create the question answering tab.
         
@@ -424,6 +424,23 @@ class UIComponents:
         
         query = st.text_area("Enter your question:", height=100)
         
+        # Improved UI for context toggle - make it more prominent with radio buttons
+        answer_mode = st.radio(
+            "Answer mode:",
+            ["With document context (RAG)", "Without document context (Direct)"],
+            index=0,
+            help="Choose whether to use your uploaded documents as context for answering."
+        )
+        use_context = (answer_mode == "With document context (RAG)")
+        
+        # Show appropriate explanation based on selected mode
+        if use_context:
+            st.info("Answers will be based on your uploaded documents. This is useful for questions related to your specific materials.")
+            if not config_manager.processed_files:
+                st.warning("No documents have been processed yet. Please upload and process documents first.")
+        else:
+            st.warning("Answers will come from the model's general knowledge, not your documents. Use this for general questions not covered in your materials.")
+        
         col1, col2 = st.columns([1, 1])
         
         with col1:
@@ -442,29 +459,34 @@ class UIComponents:
             selected_models = st.multiselect(
                 "Select models (max 5 recommended):",
                 available_models,
-                default=[available_models[0]]  # Default to first model
+                default=[available_models[0]]
             )
             
             if not selected_models:
                 st.warning("Please select at least one model")
         
         with col2:
-            # Option to enable/disable RAG context
-            use_context = st.checkbox("Include document context", value=True)
-            if not use_context:
-                st.warning("Context is disabled. Answers will not be based on your documents.")
-                search_limit = 0
-            else:
+            # Only show RAG options if using context
+            if use_context:
                 search_limit = st.slider("Number of chunks to retrieve:", min_value=3, max_value=25, value=10)
+            else:
+                search_limit = 0  # Not used in direct mode
             
-            # New option for streaming responses
+            # Option for streaming responses
             enable_streaming = st.checkbox("Enable streaming responses", value=True)
         
-        # Show a "Direct Query" button if not using context
-        if not use_context and st.button("Ask Directly") and query and selected_models:
-            # Check API keys
-            if not config_manager.api_keys["OPENROUTER_API_KEY"]:
+        # Get appropriate button label based on context mode
+        button_label = "Get Answer with Context" if use_context else "Get Direct Answer"
+        
+        # Single button for both modes
+        if st.button(button_label) and query and selected_models:
+            # Check API keys based on mode
+            if use_context and (not config_manager.api_keys["OPENAI_API_KEY"] or not config_manager.api_keys["OPENROUTER_API_KEY"]):
+                st.error("Both OpenAI and OpenRouter API keys are required for context-based answers")
+            elif not use_context and not config_manager.api_keys["OPENROUTER_API_KEY"]:
                 st.error("OpenRouter API key is required")
+            elif use_context and not config_manager.processed_files:
+                st.warning("No documents have been processed. Please upload and process documents first.")
             else:
                 with st.spinner("Processing query..."):
                     try:
@@ -484,7 +506,29 @@ class UIComponents:
                                 model_placeholders[model].info(f"Starting request for {model}...")
                                 result_placeholders[model] = st.empty()
                         
-                        # Process with streaming or concurrent generation based on user choice
+                        # Different processing paths based on whether we're using context
+                        similar_chunks = None
+                        all_sources = None
+                        
+                        if use_context:
+                            # With context - need to get embeddings and similar chunks
+                            embedding_creator.set_api_key(config_manager.api_keys["OPENAI_API_KEY"])
+                            
+                            # Create embedding for query
+                            query_embedding = embedding_creator.create_query_embedding(query)
+                            
+                            # Search for similar chunks
+                            similar_chunks = qdrant_manager.search_similar_chunks(
+                                config_manager.collection_name,
+                                query_embedding,
+                                limit=search_limit
+                            )
+                            
+                            if not similar_chunks:
+                                st.error("No relevant information found in the documents.")
+                                return
+                        
+                        # Now handle either streaming or concurrent generation
                         if enable_streaming and len(selected_models) == 1:
                             # Single model with streaming
                             model = selected_models[0]
@@ -496,19 +540,30 @@ class UIComponents:
                                 full_answer = ""
                                 for text_chunk in answer_generator.generate_answer_streaming(
                                     query, 
-                                    use_context=False,
-                                    model=model
+                                    similar_chunks, 
+                                    model=model,
+                                    use_context=use_context
                                 ):
                                     full_answer += text_chunk
                                     answer_container.markdown(full_answer)
                                 
                                 status_container.success(f"Completed streaming from {model}")
+                                
+                                # Get sources for context-based query (only if using context)
+                                if use_context:
+                                    _, all_sources = answer_generator.generate_answer(
+                                        query, 
+                                        similar_chunks, 
+                                        model=model,
+                                        use_context=True
+                                    )
                         else:
                             # Submit all tasks concurrently and get futures
                             futures = answer_generator.generate_answers_concurrently(
                                 query, 
-                                use_context=False,
-                                models=selected_models
+                                similar_chunks, 
+                                selected_models,
+                                use_context=use_context
                             )
                             
                             # Process results as they complete
@@ -522,142 +577,39 @@ class UIComponents:
                                     if result["status"] == "Completed":
                                         model_placeholders[model].success(f"Completed in {result['time_taken']:.2f}s")
                                         result_placeholders[model].markdown(result["answer"])
+                                        
+                                        # Store sources from first completed model (only if using context)
+                                        if use_context and all_sources is None:
+                                            all_sources = result["sources"]
                                     else:
                                         model_placeholders[model].error(f"Error with {model}")
                                         result_placeholders[model].error(result["answer"])
                                         
                                 except Exception as e:
                                     st.error(f"Error processing a model: {str(e)}")
+                        
+                        # Display sources in an expander outside the tabs (only if using context)
+                        if use_context and all_sources:
+                            with st.expander("View Source Documents"):
+                                # Group sources by document
+                                doc_sources = {}
+                                for source in all_sources:
+                                    doc = source['document']
+                                    if doc not in doc_sources:
+                                        doc_sources[doc] = []
+                                    doc_sources[doc].append(source)
+                                
+                                # Display sources by document
+                                for doc, chunks in doc_sources.items():
+                                    st.markdown(f"### Document: {doc}")
+                                    for i, source in enumerate(chunks):
+                                        st.markdown(f"**Excerpt {i+1} (Relevance: {source['score']:.2f})**")
+                                        st.text_area(f"Excerpt {i+1}", value=source['text'], height=150, disabled=True)
                     
                     except Exception as e:
                         st.error(f"Error processing your query: {str(e)}")
                         logger.error(f"Error processing query: {str(e)}")
-        
-        # Show "Get Answer with Context" button if using context
-        elif use_context and st.button("Get Answer with Context") and query and selected_models:
-            # Check API keys
-            if not config_manager.api_keys["OPENAI_API_KEY"] or not config_manager.api_keys["OPENROUTER_API_KEY"]:
-                st.error("Both OpenAI and OpenRouter API keys are required")
-            elif not config_manager.processed_files:
-                st.warning("No documents have been processed. Please upload and process documents first.")
-            else:
-                with st.spinner("Processing query..."):
-                    try:
-                        # Set API keys
-                        embedding_creator.set_api_key(config_manager.api_keys["OPENAI_API_KEY"])
-                        answer_generator.set_api_key(config_manager.api_keys["OPENROUTER_API_KEY"])
-                        
-                        # Create embedding for query
-                        query_embedding = embedding_creator.create_query_embedding(query)
-                        
-                        # Search for similar chunks
-                        similar_chunks = qdrant_manager.search_similar_chunks(
-                            config_manager.collection_name,
-                            query_embedding,
-                            limit=search_limit
-                        )
-                        
-                        if similar_chunks:
-                            # Create tabs for each model
-                            model_tabs = st.tabs(selected_models)
-                            
-                            # Create placeholders inside each tab
-                            model_placeholders = {}
-                            result_placeholders = {}
-                            
-                            for i, model in enumerate(selected_models):
-                                with model_tabs[i]:
-                                    model_placeholders[model] = st.empty()
-                                    model_placeholders[model].info(f"Starting request for {model}...")
-                                    result_placeholders[model] = st.empty()
-                            
-                            # Process with streaming or concurrent generation based on user choice
-                            if enable_streaming and len(selected_models) == 1:
-                                # Single model with streaming
-                                model = selected_models[0]
-                                with model_tabs[0]:
-                                    answer_container = result_placeholders[model]
-                                    status_container = model_placeholders[model]
-                                    status_container.info(f"Streaming response from {model}...")
-                                    
-                                    full_answer = ""
-                                    for text_chunk in answer_generator.generate_answer_streaming(
-                                        query, 
-                                        similar_chunks, 
-                                        model=model,
-                                        use_context=True
-                                    ):
-                                        full_answer += text_chunk
-                                        answer_container.markdown(full_answer)
-                                    
-                                    status_container.success(f"Completed streaming from {model}")
-                                    
-                                    # Get sources for the single model (we need to run the non-streaming version to get sources)
-                                    _, all_sources = answer_generator.generate_answer(
-                                        query, 
-                                        similar_chunks, 
-                                        model=model,
-                                        use_context=True
-                                    )
-                            else:
-                                # Submit all tasks concurrently and get futures
-                                futures = answer_generator.generate_answers_concurrently(
-                                    query, 
-                                    similar_chunks, 
-                                    selected_models,
-                                    use_context=True
-                                )
-                                
-                                # Initialize sources
-                                all_sources = None
-                                
-                                # Process results as they complete (in the main thread)
-                                for future in concurrent.futures.as_completed(futures):
-                                    try:
-                                        # Get the result
-                                        result = future.result()
-                                        model = result["model"]
-                                        
-                                        # Update UI with the result (safe in main thread)
-                                        if result["status"] == "Completed":
-                                            model_placeholders[model].success(f"Completed in {result['time_taken']:.2f}s")
-                                            result_placeholders[model].markdown(result["answer"])
-                                            
-                                            # Store sources from first completed model
-                                            if all_sources is None:
-                                                all_sources = result["sources"]
-                                        else:
-                                            model_placeholders[model].error(f"Error with {model}")
-                                            result_placeholders[model].error(result["answer"])
-                                            
-                                    except Exception as e:
-                                        # If we can't determine which model had an error, show a general error
-                                        st.error(f"Error processing a model: {str(e)}")
-                                                            
-                            # Display sources in an expander outside the tabs
-                            if all_sources:
-                                with st.expander("View Source Documents"):
-                                    # Group sources by document
-                                    doc_sources = {}
-                                    for source in all_sources:
-                                        doc = source['document']
-                                        if doc not in doc_sources:
-                                            doc_sources[doc] = []
-                                        doc_sources[doc].append(source)
-                                    
-                                    # Display sources by document
-                                    for doc, chunks in doc_sources.items():
-                                        st.markdown(f"### Document: {doc}")
-                                        for i, source in enumerate(chunks):
-                                            st.markdown(f"**Excerpt {i+1} (Relevance: {source['score']:.2f})**")
-                                            st.text_area(f"Excerpt {i+1}", value=source['text'], height=150, disabled=True)
-                        else:
-                            st.error("No relevant information found in the documents.")
-                            
-                    except Exception as e:
-                        st.error(f"Error processing your query: {str(e)}")
-                        logger.error(f"Error processing query: {str(e)}")
-    
+
     @staticmethod
     def create_main_page_layout(config_manager, 
                                text_extractor, 
