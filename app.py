@@ -1,9 +1,9 @@
 """
-DocumentGPT: Advanced RAG Assistant
+Document Search Engine: Advanced Document Indexing and Search
 
-This application helps users quickly search and ask questions about their documents
-using a Graph RAG (Retrieval Augmented Generation) approach with flexible prompt templates
-and the option to use models directly without document context.
+This application helps users quickly search and find information in their documents
+using advanced indexing and retrieval methods with flexible search parameters
+and the option to search general knowledge when documents don't contain the answer.
 
 Main entry point for the application.
 """
@@ -32,7 +32,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("documentgpt.log")
+        logging.FileHandler("document_search.log")
     ]
 )
 logger = logging.getLogger(__name__)
@@ -50,11 +50,11 @@ def initialize_session_state():
 
 def main():
     """
-    Main entry point for the DocumentGPT application.
+    Main entry point for the Document Search Engine application.
     Initializes all components and starts the UI.
     """
     try:
-        logger.info("Starting DocumentGPT application")
+        logger.info("Starting Document Search Engine application")
 
         # Initialize session state
         initialize_session_state()
@@ -74,7 +74,7 @@ def main():
             api_key=config_manager.api_keys["QDRANT_API_KEY"]
         )
         
-        # Initialize answer generator
+        # Initialize search engine
         answer_generator = AnswerGenerator(
             openrouter_api_key=config_manager.api_keys["OPENROUTER_API_KEY"]
         )
