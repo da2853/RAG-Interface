@@ -1,7 +1,6 @@
 {
   "collection_name": "test_collection_v1",
   "processed_files": [
-    "KBAI Transcripts - Modules 1-12 (Up to Midterm).pdf"
   ],
   "api_keys": {
     "OPENAI_API_KEY": "",
